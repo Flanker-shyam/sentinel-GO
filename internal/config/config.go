@@ -1,0 +1,82 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the top-level configuration.
+type Config struct {
+	Targets   []TargetConfig   `yaml:"targets"`
+	Streaming StreamingConfig  `yaml:"streaming"`
+	Analysis  AnalysisConfig   `yaml:"analysis"`
+}
+
+// TargetConfig defines which pods to stream from.
+type TargetConfig struct {
+	Namespace         string   `yaml:"namespace"`
+	PodPatterns       []string `yaml:"pod_patterns"`
+	ContainerPatterns []string `yaml:"container_patterns"`
+}
+
+// StreamingConfig controls stream behavior.
+type StreamingConfig struct {
+	BufferSize int   `yaml:"buffer_size"`
+	TailLines  int64 `yaml:"tail_lines"`
+}
+
+// AnalysisConfig controls batching and LLM.
+type AnalysisConfig struct {
+	BatchSize        int           `yaml:"batch_size"`
+	FlushInterval    time.Duration `yaml:"flush_interval"`
+	Region           string        `yaml:"region"`
+	ModelID          string        `yaml:"model_id"`
+	MaxTokens        int           `yaml:"max_tokens"`
+	AnomalyThreshold int           `yaml:"anomaly_threshold"`
+}
+
+// Load reads and parses the YAML config file.
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	cfg.applyDefaults()
+	return &cfg, nil
+}
+
+func (c *Config) applyDefaults() {
+	if c.Streaming.BufferSize == 0 {
+		c.Streaming.BufferSize = 1000
+	}
+	if c.Streaming.TailLines == 0 {
+		c.Streaming.TailLines = 50
+	}
+	if c.Analysis.BatchSize == 0 {
+		c.Analysis.BatchSize = 50
+	}
+	if c.Analysis.FlushInterval == 0 {
+		c.Analysis.FlushInterval = 30 * time.Second
+	}
+	if c.Analysis.Region == "" {
+		c.Analysis.Region = "eu-west-1"
+	}
+	if c.Analysis.ModelID == "" {
+		c.Analysis.ModelID = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+	}
+	if c.Analysis.MaxTokens == 0 {
+		c.Analysis.MaxTokens = 2048
+	}
+	if c.Analysis.AnomalyThreshold == 0 {
+		c.Analysis.AnomalyThreshold = 6
+	}
+}

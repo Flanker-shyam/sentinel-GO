@@ -1,0 +1,11 @@
+# Binaries
+sentinel
+sentinel-GO
+*.exe
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
