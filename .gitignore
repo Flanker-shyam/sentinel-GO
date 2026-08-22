@@ -3,6 +3,9 @@ sentinel
 sentinel-GO
 *.exe
 
+# Environment
+.env
+
 # OS files
 .DS_Store
 
