@@ -7,15 +7,21 @@ import (
 	"log"
 	"strings"
 
-	"github.com/Flanker-shyam/sentinel-GO/internal/discovery"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
+// PodInfo holds the info needed to open a log stream.
+type PodInfo struct {
+	Namespace string
+	PodName   string
+	Container string
+}
+
 // Stream opens a follow-stream on the given pod/container and pushes
 // severity-filtered lines into the output channel.
 // It blocks until the stream ends or ctx is cancelled.
-func Stream(ctx context.Context, clientset *kubernetes.Clientset, pod discovery.PodStream, tailLines int64, out chan<- string) {
+func Stream(ctx context.Context, clientset *kubernetes.Clientset, pod PodInfo, tailLines int64, out chan<- string) {
 	logOpts := &corev1.PodLogOptions{
 		Follow:     true,
 		Timestamps: true,
@@ -28,12 +34,12 @@ func Stream(ctx context.Context, clientset *kubernetes.Clientset, pod discovery.
 		GetLogs(pod.PodName, logOpts).
 		Stream(ctx)
 	if err != nil {
-		log.Printf("failed to open log stream for %s/%s: %v", pod.Namespace, pod.PodName, err)
+		log.Printf("[streamer] failed to open log stream for %s/%s/%s: %v", pod.Namespace, pod.PodName, pod.Container, err)
 		return
 	}
 
 	if err := filterAndForward(ctx, stream, out); err != nil {
-		log.Printf("stream ended for %s/%s: %v", pod.Namespace, pod.PodName, err)
+		log.Printf("[streamer] stream ended for %s/%s/%s: %v", pod.Namespace, pod.PodName, pod.Container, err)
 	}
 }
 

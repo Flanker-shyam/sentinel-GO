@@ -6,6 +6,8 @@ A Go-based log streamer that continuously ingests logs from Kubernetes pods on A
 
 ```
 K8s Pods → Log Stream → Severity Filter → Batch → LLM Analysis → Alert
+     ↕
+Dynamic Discovery (Watch API — auto-tracks scale up/down/deploy)
 ```
 
 ## Prerequisites
@@ -105,43 +107,61 @@ go run ./cmd/sentinel/
 ## Output
 
 ```
-Streaming from 3 pods:
-  - tp-rc/plan-outcome-reporting-compute-7c97c-6gbz2 [plan-outcome-reporting-compute]
-  - tp-rc/plan-outcome-reporting-compute-7c97c-xk2z1 [plan-outcome-reporting-compute]
-  - tp-rc/plan-outcome-reporting-api-5b8f4-mn9q3 [plan-outcome-reporting-api]
+sentinel-go starting (dynamic discovery mode)
+2026/08/22 20:00:00 [discovery] ▶ start streaming tp-rc/plan-outcome-reporting-compute-7c97c-6gbz2/plan-outcome-reporting-compute
+2026/08/22 20:00:00 [discovery] ▶ start streaming tp-rc/plan-outcome-reporting-compute-7c97c-xk2z1/plan-outcome-reporting-compute
+2026/08/22 20:00:00 [discovery] ▶ start streaming tp-rc/plan-outcome-reporting-api-5b8f4-mn9q3/plan-outcome-reporting-api
 
 2026/08/22 20:00:30 ✅ Batch of 12 logs analyzed — no anomaly (severity=2)
 2026/08/22 20:01:00 🚨 ANOMALY DETECTED [severity=8]: Database connection failure causing cascading errors
    Root cause: PostgreSQL unreachable - connection pool exhausted
    Affected: [plan-outcome-reporting-compute]
    Action: Check RDS instance status and security groups
+
+# On rolling deploy:
+2026/08/22 20:05:00 [discovery] ▶ start streaming tp-rc/plan-outcome-reporting-compute-8d4a1-abc12/plan-outcome-reporting-compute
+2026/08/22 20:05:02 [discovery] ■ stopped streaming tp-rc/plan-outcome-reporting-compute-7c97c-6gbz2/plan-outcome-reporting-compute
 ```
 
 ## Project Structure
 
 ```
-├── cmd/sentinel/main.go           # Entrypoint — wires all components
+├── cmd/sentinel/main.go               # Entrypoint — wires all components
 ├── internal/
-│   ├── k8s/client.go              # Kubernetes client (kubeconfig / in-cluster)
-│   ├── discovery/discovery.go     # Pod discovery via regex pattern matching
-│   ├── streamer/streamer.go       # Log streaming + severity filtering
+│   ├── k8s/client.go                  # Kubernetes client (kubeconfig / in-cluster)
+│   ├── discovery/
+│   │   ├── discovery.go              # Pod discovery (one-shot, used for initial list)
+│   │   └── discovery-controller.go   # Dynamic controller (Watch API, lifecycle mgmt)
+│   ├── streamer/streamer.go           # Log streaming + severity filtering
 │   ├── analysis/
-│   │   ├── batch.go              # Time/size-based batching
-│   │   └── bedrock.go            # AWS Bedrock (Claude) LLM integration
-│   └── config/config.go          # YAML config loader
-├── configs/sentinel.yaml          # Default configuration
-├── docs/HLD.md                    # High Level Design document
-└── .env.example                   # Environment variable template
+│   │   ├── batch.go                  # Time/size-based batching
+│   │   └── bedrock.go                # AWS Bedrock (Claude) LLM integration
+│   └── config/config.go              # YAML config loader
+├── configs/sentinel.yaml              # Default configuration
+├── docs/HLD.md                        # High Level Design document
+└── .env.example                       # Environment variable template
 ```
 
 ## How It Works
 
-1. **Discovery** — Finds running pods matching your regex patterns in configured namespaces
-2. **Streaming** — Opens a `follow=true` log stream per pod (like `kubectl logs -f`)
-3. **Filtering** — Only passes ERROR/WARN/FATAL/PANIC level logs (JSON `"level"` field)
-4. **Batching** — Collects filtered logs until batch is full (50) or time window expires (30s)
-5. **Analysis** — Sends batch to Claude on Bedrock with a structured prompt
-6. **Alerting** — If Claude detects an anomaly with severity >= threshold, logs an alert
+1. **Discovery** — Uses K8s Watch API to continuously track pods matching your regex patterns. Automatically handles scale up/down and rolling deploys.
+2. **Streaming** — Opens a `follow=true` log stream per pod/container (like `kubectl logs -f`). One goroutine per stream, all feeding a shared channel.
+3. **Filtering** — Only passes ERROR/WARN/FATAL/PANIC level logs (JSON `"level"` field).
+4. **Batching** — Collects filtered logs until batch is full (50) or time window expires (30s).
+5. **Analysis** — Sends batch to Claude on Bedrock with a structured prompt.
+6. **Alerting** — If Claude detects an anomaly with severity >= threshold, logs an alert.
+
+## Dynamic Discovery
+
+The discovery controller handles pod lifecycle events automatically:
+
+| Scenario | Behavior |
+|----------|----------|
+| **Scale up** (3→5 replicas) | New pods detected via Watch → streaming starts automatically |
+| **Scale down** (5→3 replicas) | Pods deleted → goroutines cancelled, cleaned up |
+| **Rolling deploy** | New pods start streaming before old pods are terminated — no log gap |
+| **Pod crash/restart** | Stream breaks → goroutine exits → next reconcile restarts it |
+| **Watch expires** (~5 min) | Re-lists pods, reconciles state, re-establishes watch |
 
 ## IAM Permissions Required
 
@@ -157,16 +177,14 @@ Your SAML role needs:
 
 ## Known Limitations (v1)
 
-- Discovery is one-shot (no dynamic pod tracking on scale up/down/deploy)
-- No stream retry on disconnection
-- No log deduplication
+- No log deduplication (duplicate errors during storms all go to LLM)
 - Only detects severity in JSON logs with `"level"` field
 - No notification sinks yet (Slack, SNS — coming soon)
 - No rate limiting on LLM calls
+- No alert cooldown per service
 
 ## Roadmap
 
-- [ ] Dynamic pod discovery (K8s Watch API)
 - [ ] Stream reconnection with backoff
 - [ ] Log deduplication (bloom filter)
 - [ ] Notification sinks (Slack, SNS, PagerDuty)

@@ -167,18 +167,18 @@ func (b *BedrockAnalyzer) AnalyzeBatch(logs []string) {
 
 	result, err := b.Analyze(ctx, logs)
 	if err != nil {
-		log.Printf("LLM analysis failed: %v", err)
+		log.Printf("[analysis] LLM analysis failed: %v", err)
 		return
 	}
 
 	if b.ShouldAlert(result) {
-		log.Printf("🚨 ANOMALY DETECTED [severity=%d]: %s", result.Severity, result.Summary)
-		log.Printf("   Root cause: %s", result.RootCause)
-		log.Printf("   Affected: %v", result.AffectedServices)
-		log.Printf("   Action: %s", result.Recommendation)
+		log.Printf("[analysis] 🚨 ANOMALY DETECTED [severity=%d]: %s", result.Severity, result.Summary)
+		log.Printf("[analysis]    Root cause: %s", result.RootCause)
+		log.Printf("[analysis]    Affected: %v", result.AffectedServices)
+		log.Printf("[analysis]    Action: %s", result.Recommendation)
 		// TODO: Send to alert sinks (Slack, SNS, etc.)
 	} else {
-		log.Printf("✅ Batch of %d logs analyzed — no anomaly (severity=%d)", len(logs), result.Severity)
+		log.Printf("[analysis] ✅ Batch of %d logs — no anomaly (severity=%d)", len(logs), result.Severity)
 	}
 }
 

@@ -55,7 +55,7 @@ func Discover(ctx context.Context, clientset *kubernetes.Clientset, targets []Ta
 
 		pods, err := clientset.CoreV1().Pods(target.Namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			log.Printf("failed to list pods in %s: %v", target.Namespace, err)
+			log.Printf("[discovery] failed to list pods in %s: %v", target.Namespace, err)
 			continue
 		}
 
@@ -70,7 +70,7 @@ func Discover(ctx context.Context, clientset *kubernetes.Clientset, targets []Ta
 			// Pick container(s) matching the patterns
 			containers := pickContainers(pod, containerRegexes)
 			if len(containers) == 0 {
-				log.Printf("no matching container in pod %s", pod.Name)
+				log.Printf("[discovery] no matching container in pod %s/%s", target.Namespace, pod.Name)
 				continue
 			}
 
