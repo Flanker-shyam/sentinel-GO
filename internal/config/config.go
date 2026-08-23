@@ -10,9 +10,11 @@ import (
 
 // Config is the top-level configuration.
 type Config struct {
-	Targets   []TargetConfig   `yaml:"targets"`
-	Streaming StreamingConfig  `yaml:"streaming"`
-	Analysis  AnalysisConfig   `yaml:"analysis"`
+	Targets      []TargetConfig    `yaml:"targets"`
+	Streaming    StreamingConfig   `yaml:"streaming"`
+	Analysis     AnalysisConfig    `yaml:"analysis"`
+	Dedup        DedupConfig       `yaml:"dedup"`
+	Notification NotificationConfig `yaml:"notification"`
 }
 
 // TargetConfig defines which pods to stream from.
@@ -36,6 +38,24 @@ type AnalysisConfig struct {
 	ModelID          string        `yaml:"model_id"`
 	MaxTokens        int           `yaml:"max_tokens"`
 	AnomalyThreshold int           `yaml:"anomaly_threshold"`
+	MinCallInterval  time.Duration `yaml:"min_call_interval"`
+}
+
+// DedupConfig controls log deduplication.
+type DedupConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Window  time.Duration `yaml:"window"`
+}
+
+// NotificationConfig controls alert notifications.
+type NotificationConfig struct {
+	GoogleChat GoogleChatConfig `yaml:"google_chat"`
+}
+
+// GoogleChatConfig holds Google Chat webhook settings.
+type GoogleChatConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	WebhookURL string `yaml:"webhook_url"`
 }
 
 // Load reads and parses the YAML config file.
@@ -45,8 +65,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
+	// Expand environment variables (e.g., ${GCHAT_WEBHOOK_URL})
+	expanded := os.ExpandEnv(string(data))
+
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -78,5 +101,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Analysis.AnomalyThreshold == 0 {
 		c.Analysis.AnomalyThreshold = 6
+	}
+	if c.Analysis.MinCallInterval == 0 {
+		c.Analysis.MinCallInterval = 10 * time.Second
+	}
+	if c.Dedup.Window == 0 {
+		c.Dedup.Window = 60 * time.Second
 	}
 }

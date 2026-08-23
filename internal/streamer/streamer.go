@@ -5,7 +5,9 @@ import (
 	"context"
 	"io"
 	"log"
+	"math/rand"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -18,10 +20,34 @@ type PodInfo struct {
 	Container string
 }
 
-// Stream opens a follow-stream on the given pod/container and pushes
-// severity-filtered lines into the output channel.
-// It blocks until the stream ends or ctx is cancelled.
+// Stream opens a follow-stream on the given pod/container with automatic
+// reconnection on failure. Uses exponential backoff with jitter.
+// It blocks until ctx is cancelled.
 func Stream(ctx context.Context, clientset *kubernetes.Clientset, pod PodInfo, tailLines int64, out chan<- string) {
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		err := streamOnce(ctx, clientset, pod, tailLines, out)
+		if ctx.Err() != nil {
+			return // intentional shutdown
+		}
+
+		log.Printf("[streamer] stream broke for %s/%s/%s: %v — reconnecting in %v",
+			pod.Namespace, pod.PodName, pod.Container, err, backoff)
+
+		// Wait with backoff before retrying
+		select {
+		case <-time.After(backoff + jitter(backoff)):
+			backoff = min(backoff*2, maxBackoff)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// streamOnce opens a single stream and reads until it ends or errors.
+func streamOnce(ctx context.Context, clientset *kubernetes.Clientset, pod PodInfo, tailLines int64, out chan<- string) error {
 	logOpts := &corev1.PodLogOptions{
 		Follow:     true,
 		Timestamps: true,
@@ -34,13 +60,10 @@ func Stream(ctx context.Context, clientset *kubernetes.Clientset, pod PodInfo, t
 		GetLogs(pod.PodName, logOpts).
 		Stream(ctx)
 	if err != nil {
-		log.Printf("[streamer] failed to open log stream for %s/%s/%s: %v", pod.Namespace, pod.PodName, pod.Container, err)
-		return
+		return err
 	}
 
-	if err := filterAndForward(ctx, stream, out); err != nil {
-		log.Printf("[streamer] stream ended for %s/%s/%s: %v", pod.Namespace, pod.PodName, pod.Container, err)
-	}
+	return filterAndForward(ctx, stream, out)
 }
 
 // filterAndForward reads lines from the stream, filters by severity,
@@ -83,4 +106,9 @@ func isSevere(line string) bool {
 	level := strings.ToUpper(line[start : start+end])
 	return level == "ERROR" || level == "WARN" || level == "WARNING" ||
 		level == "FATAL" || level == "PANIC"
+}
+
+// jitter adds randomness to avoid thundering herd on reconnect.
+func jitter(d time.Duration) time.Duration {
+	return time.Duration(rand.Int63n(int64(d) / 2))
 }

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
+
+	"github.com/Flanker-shyam/sentinel-GO/internal/notify"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -68,6 +71,13 @@ type BedrockAnalyzer struct {
 	maxTokens        int
 	anomalyThreshold int
 	namespace        string
+	rateLimiter      <-chan time.Time // rate limit LLM calls
+	notifier         Notifier         // optional notification sink
+}
+
+// Notifier is an interface for sending alerts.
+type Notifier interface {
+	Send(ctx context.Context, alert notify.Alert) error
 }
 
 // BedrockConfig holds configuration for the Bedrock analyzer.
@@ -77,6 +87,8 @@ type BedrockConfig struct {
 	MaxTokens        int
 	AnomalyThreshold int
 	Namespace        string
+	MinCallInterval  time.Duration // minimum time between LLM calls
+	Notifier         Notifier      // optional
 }
 
 // NewBedrockAnalyzer creates a new Bedrock-based log analyzer.
@@ -89,12 +101,20 @@ func NewBedrockAnalyzer(ctx context.Context, cfg BedrockConfig) (*BedrockAnalyze
 
 	client := bedrockruntime.NewFromConfig(awsCfg)
 
+	// Default rate limit: 1 call per 10 seconds
+	interval := cfg.MinCallInterval
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+
 	return &BedrockAnalyzer{
 		client:           client,
 		modelID:          cfg.ModelID,
 		maxTokens:        cfg.MaxTokens,
 		anomalyThreshold: cfg.AnomalyThreshold,
 		namespace:        cfg.Namespace,
+		rateLimiter:      time.Tick(interval),
+		notifier:         cfg.Notifier,
 	}, nil
 }
 
@@ -162,7 +182,11 @@ func (b *BedrockAnalyzer) ShouldAlert(result *AnalysisResult) bool {
 
 // AnalyzeBatch is a convenience method that analyzes and logs the result.
 // Use this as the AnalyzeFunc passed to BatchAndAnalyze.
+// Respects the rate limiter — blocks until the next call is allowed.
 func (b *BedrockAnalyzer) AnalyzeBatch(logs []string) {
+	// Wait for rate limiter to allow next call
+	<-b.rateLimiter
+
 	ctx := context.Background()
 
 	result, err := b.Analyze(ctx, logs)
@@ -176,7 +200,21 @@ func (b *BedrockAnalyzer) AnalyzeBatch(logs []string) {
 		log.Printf("[analysis]    Root cause: %s", result.RootCause)
 		log.Printf("[analysis]    Affected: %v", result.AffectedServices)
 		log.Printf("[analysis]    Action: %s", result.Recommendation)
-		// TODO: Send to alert sinks (Slack, SNS, etc.)
+
+		// Send notification if configured
+		if b.notifier != nil {
+			alert := notify.Alert{
+				Severity:         result.Severity,
+				Summary:          result.Summary,
+				RootCause:        result.RootCause,
+				AffectedServices: result.AffectedServices,
+				Recommendation:   result.Recommendation,
+				Timestamp:        time.Now(),
+			}
+			if err := b.notifier.Send(ctx, alert); err != nil {
+				log.Printf("[analysis] failed to send notification: %v", err)
+			}
+		}
 	} else {
 		log.Printf("[analysis] ✅ Batch of %d logs — no anomaly (severity=%d)", len(logs), result.Severity)
 	}
