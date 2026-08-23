@@ -12,11 +12,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// StreamFunc is the function signature for streaming logs from a pod.
-// This avoids a circular import between discovery and streamer packages.
-type StreamFunc func(ctx context.Context, clientset *kubernetes.Clientset, pod PodStream, out chan<- string)
-
 // Controller continuously discovers and streams from pods matching configured targets.
+// It uses the K8s Watch API to react to pod lifecycle events in real-time.
 type Controller struct {
 	clientset  *kubernetes.Clientset
 	targets    []Target
@@ -85,19 +82,15 @@ func (c *Controller) watchNamespace(ctx context.Context, namespace string) {
 			continue
 		}
 
-		// Process events until watch expires or ctx is done
-		c.handleEvents(ctx, watcher, namespace)
+		c.handleEvents(ctx, watcher)
 		watcher.Stop()
 
-		// Watch expired — loop back to LIST
 		log.Printf("[discovery] watch expired for %s, re-listing", namespace)
 	}
 }
 
 // reconcile compares the active map against the current pod list.
-// Starts missing goroutines, stops stale ones.
 func (c *Controller) reconcile(ctx context.Context, namespace string, pods []corev1.Pod) {
-	// Collect what SHOULD be active
 	desired := make(map[string]PodStream)
 	for _, pod := range pods {
 		if pod.Status.Phase != corev1.PodRunning {
@@ -107,7 +100,7 @@ func (c *Controller) reconcile(ctx context.Context, namespace string, pods []cor
 			continue
 		}
 
-		containers := c.pickContainers(pod)
+		containers := c.pickContainersForPod(pod)
 		for _, container := range containers {
 			key := podKey(namespace, pod.Name, container)
 			desired[key] = PodStream{
@@ -121,14 +114,14 @@ func (c *Controller) reconcile(ctx context.Context, namespace string, pods []cor
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Start goroutines for pods in desired but not in active
+	// Start missing
 	for key, ps := range desired {
 		if _, exists := c.active[key]; !exists {
 			c.startStream(ctx, key, ps)
 		}
 	}
 
-	// Stop goroutines for pods in active but not in desired (stale)
+	// Stop stale
 	for key := range c.active {
 		if _, exists := desired[key]; !exists {
 			if belongsToNamespace(key, namespace) {
@@ -139,14 +132,14 @@ func (c *Controller) reconcile(ctx context.Context, namespace string, pods []cor
 }
 
 // handleEvents processes watch events until the channel closes or ctx is done.
-func (c *Controller) handleEvents(ctx context.Context, watcher watch.Interface, namespace string) {
+func (c *Controller) handleEvents(ctx context.Context, watcher watch.Interface) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case event, ok := <-watcher.ResultChan():
 			if !ok {
-				return // watch channel closed (expired)
+				return
 			}
 
 			pod, ok := event.Object.(*corev1.Pod)
@@ -156,41 +149,40 @@ func (c *Controller) handleEvents(ctx context.Context, watcher watch.Interface, 
 
 			switch event.Type {
 			case watch.Added, watch.Modified:
-				c.handlePodUpdate(ctx, namespace, pod)
+				c.handlePodUpdate(ctx, pod)
 			case watch.Deleted:
-				c.handlePodDelete(namespace, pod)
+				c.handlePodDelete(pod)
 			}
 		}
 	}
 }
 
-func (c *Controller) handlePodUpdate(ctx context.Context, namespace string, pod *corev1.Pod) {
-	if pod.Status.Phase == corev1.PodRunning && c.matchesPod(namespace, pod.Name) {
-		containers := c.pickContainers(*pod)
+func (c *Controller) handlePodUpdate(ctx context.Context, pod *corev1.Pod) {
+	if pod.Status.Phase == corev1.PodRunning && c.matchesPod(pod.Namespace, pod.Name) {
+		containers := c.pickContainersForPod(*pod)
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for _, container := range containers {
-			key := podKey(namespace, pod.Name, container)
+			key := podKey(pod.Namespace, pod.Name, container)
 			if _, exists := c.active[key]; !exists {
 				c.startStream(ctx, key, PodStream{
-					Namespace: namespace,
+					Namespace: pod.Namespace,
 					PodName:   pod.Name,
 					Container: container,
 				})
 			}
 		}
 	} else {
-		// Pod is no longer Running (Terminating, Failed, etc.) — stop streaming
-		c.handlePodDelete(namespace, pod)
+		c.handlePodDelete(pod)
 	}
 }
 
-func (c *Controller) handlePodDelete(namespace string, pod *corev1.Pod) {
-	containers := c.pickContainers(*pod)
+func (c *Controller) handlePodDelete(pod *corev1.Pod) {
+	containers := c.pickContainersForPod(*pod)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, container := range containers {
-		key := podKey(namespace, pod.Name, container)
+		key := podKey(pod.Namespace, pod.Name, container)
 		c.stopStream(key)
 	}
 }
@@ -204,7 +196,6 @@ func (c *Controller) startStream(ctx context.Context, key string, ps PodStream) 
 
 	go func() {
 		defer func() {
-			// Clean up on exit (stream broke, pod died, etc.)
 			c.mu.Lock()
 			delete(c.active, key)
 			c.mu.Unlock()
@@ -222,7 +213,7 @@ func (c *Controller) stopStream(key string) {
 	}
 }
 
-// --- Helpers ---
+// --- Controller helpers ---
 
 func podKey(namespace, podName, container string) string {
 	return namespace + "/" + podName + "/" + container
@@ -250,13 +241,13 @@ func (c *Controller) matchesPod(namespace, podName string) bool {
 	return false
 }
 
-func (c *Controller) pickContainers(pod corev1.Pod) []string {
+// pickContainersForPod selects containers for a pod based on configured target patterns.
+func (c *Controller) pickContainersForPod(pod corev1.Pod) []string {
 	for _, t := range c.targets {
 		if t.Namespace != pod.Namespace {
 			continue
 		}
 
-		// Check if pod matches this target
 		matched := false
 		for _, pattern := range t.PodPatterns {
 			re, err := regexp.Compile("^" + pattern + "$")
@@ -272,7 +263,6 @@ func (c *Controller) pickContainers(pod corev1.Pod) []string {
 			continue
 		}
 
-		// Use container patterns from this target
 		if len(t.ContainerPatterns) > 0 {
 			var result []string
 			for _, container := range pod.Spec.Containers {
