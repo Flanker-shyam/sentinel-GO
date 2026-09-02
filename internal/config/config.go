@@ -59,7 +59,13 @@ type GoogleChatConfig struct {
 }
 
 // Load reads and parses the YAML config file.
+// It first loads a .env file (if present) so ${VAR} references resolve.
 func Load(path string) (*Config, error) {
+	// Load .env file into the environment (real env vars take precedence)
+	if err := loadDotEnv(".env"); err != nil {
+		return nil, fmt.Errorf("load .env: %w", err)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)

@@ -36,10 +36,13 @@ func NewGoogleChatNotifier(webhookURL string) *GoogleChatNotifier {
 
 // Send posts an alert to the Google Chat space.
 func (g *GoogleChatNotifier) Send(ctx context.Context, alert Alert) error {
-	message := g.formatMessage(alert)
+	return g.SendText(ctx, g.formatMessage(alert))
+}
 
+// SendText posts a plain text message to the Google Chat space.
+func (g *GoogleChatNotifier) SendText(ctx context.Context, text string) error {
 	payload := gchatMessage{
-		Text: message,
+		Text: text,
 	}
 
 	body, err := json.Marshal(payload)

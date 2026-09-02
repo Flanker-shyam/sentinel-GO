@@ -5,6 +5,7 @@ import (
 	"log"
 	"regexp"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,7 +53,12 @@ func (c *Controller) Run(ctx context.Context) {
 }
 
 // watchNamespace runs the list-then-watch loop for a single namespace.
+// On connectivity failures (e.g., VPN down) it backs off exponentially
+// instead of hammering the API server in a tight loop.
 func (c *Controller) watchNamespace(ctx context.Context, namespace string) {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -64,7 +70,11 @@ func (c *Controller) watchNamespace(ctx context.Context, namespace string) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("[discovery] failed to list pods in %s: %v", namespace, err)
+			log.Printf("[discovery] failed to list pods in %s: %v — retrying in %v", namespace, err, backoff)
+			if !sleepCtx(ctx, backoff) {
+				return
+			}
+			backoff = minDuration(backoff*2, maxBackoff)
 			continue
 		}
 
@@ -78,15 +88,39 @@ func (c *Controller) watchNamespace(ctx context.Context, namespace string) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("[discovery] failed to watch %s: %v", namespace, err)
+			log.Printf("[discovery] failed to watch %s: %v — retrying in %v", namespace, err, backoff)
+			if !sleepCtx(ctx, backoff) {
+				return
+			}
+			backoff = minDuration(backoff*2, maxBackoff)
 			continue
 		}
+
+		// Successful connection — reset backoff
+		backoff = time.Second
 
 		c.handleEvents(ctx, watcher)
 		watcher.Stop()
 
 		log.Printf("[discovery] watch expired for %s, re-listing", namespace)
 	}
+}
+
+// sleepCtx waits for d or until ctx is cancelled. Returns false if cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // reconcile compares the active map against the current pod list.

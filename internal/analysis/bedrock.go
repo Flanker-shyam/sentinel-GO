@@ -52,7 +52,9 @@ If the logs show no anomaly (just normal operational noise), respond:
   "root_cause": "N/A",
   "affected_services": [],
   "recommendation": "No action required"
-}`
+}
+
+IMPORTANT: Output ONLY the raw JSON object. Do NOT wrap it in markdown code fences (no ` + "```" + `). Do NOT add any explanation before or after the JSON.`
 
 // AnalysisResult holds the LLM's assessment of a log batch.
 type AnalysisResult struct {
@@ -73,6 +75,7 @@ type BedrockAnalyzer struct {
 	namespace        string
 	rateLimiter      <-chan time.Time // rate limit LLM calls
 	notifier         Notifier         // optional notification sink
+	onAlert          func()           // optional callback fired when an anomaly alert is raised
 }
 
 // Notifier is an interface for sending alerts.
@@ -89,6 +92,7 @@ type BedrockConfig struct {
 	Namespace        string
 	MinCallInterval  time.Duration // minimum time between LLM calls
 	Notifier         Notifier      // optional
+	OnAlert          func()        // optional — called when an anomaly alert fires
 }
 
 // NewBedrockAnalyzer creates a new Bedrock-based log analyzer.
@@ -115,6 +119,7 @@ func NewBedrockAnalyzer(ctx context.Context, cfg BedrockConfig) (*BedrockAnalyze
 		namespace:        cfg.Namespace,
 		rateLimiter:      time.Tick(interval),
 		notifier:         cfg.Notifier,
+		onAlert:          cfg.OnAlert,
 	}, nil
 }
 
@@ -166,13 +171,28 @@ func (b *BedrockAnalyzer) Analyze(ctx context.Context, logs []string) (*Analysis
 		return nil, fmt.Errorf("empty response from model")
 	}
 
-	// Extract the JSON from Claude's text response
+	// Extract the JSON object from Claude's text response.
+	// Claude often wraps JSON in markdown fences (```json ... ```) or adds
+	// explanatory text, so we extract the {...} span before parsing.
+	jsonText := extractJSON(response.Content[0].Text)
+
 	var result AnalysisResult
-	if err := json.Unmarshal([]byte(response.Content[0].Text), &result); err != nil {
+	if err := json.Unmarshal([]byte(jsonText), &result); err != nil {
 		return nil, fmt.Errorf("parse analysis result: %w (raw: %s)", err, response.Content[0].Text)
 	}
 
 	return &result, nil
+}
+
+// extractJSON pulls the first JSON object out of a text blob that may be
+// wrapped in markdown code fences or accompanied by explanatory prose.
+func extractJSON(text string) string {
+	start := strings.IndexByte(text, '{')
+	end := strings.LastIndexByte(text, '}')
+	if start == -1 || end == -1 || end < start {
+		return text // no object found — return as-is so the error surfaces the raw text
+	}
+	return text[start : end+1]
 }
 
 // ShouldAlert returns true if the analysis result warrants an alert.
@@ -214,6 +234,11 @@ func (b *BedrockAnalyzer) AnalyzeBatch(logs []string) {
 			if err := b.notifier.Send(ctx, alert); err != nil {
 				log.Printf("[analysis] failed to send notification: %v", err)
 			}
+		}
+
+		// Signal that an alert fired (resets the heartbeat timer)
+		if b.onAlert != nil {
+			b.onAlert()
 		}
 	} else {
 		log.Printf("[analysis] ✅ Batch of %d logs — no anomaly (severity=%d)", len(logs), result.Severity)
