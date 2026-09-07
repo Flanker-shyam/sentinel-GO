@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Flanker-shyam/sentinel-GO/internal/notify"
@@ -31,11 +32,14 @@ Respond ONLY in valid JSON with this exact schema:
 {
   "is_anomaly": boolean,
   "severity": integer (1-10),
+  "issue_type": "short_snake_case_category",
   "summary": "one-line description of what's happening",
   "root_cause": "most likely cause based on the evidence",
   "affected_services": ["service names extracted from logs"],
   "recommendation": "immediate action to take"
 }
+
+The "issue_type" MUST be a short, stable, lowercase snake_case category that identifies the KIND of problem, so the same recurring problem always gets the same value. Examples: "http_404_errors", "db_connection_failure", "out_of_memory", "timeout", "auth_failure", "rate_limit_exceeded". Two occurrences of the same underlying problem must produce the same issue_type. Use "none" when there is no anomaly.
 
 Severity scale:
 1-3: Low — isolated errors, likely transient
@@ -48,6 +52,7 @@ If the logs show no anomaly (just normal operational noise), respond:
 {
   "is_anomaly": false,
   "severity": 1,
+  "issue_type": "none",
   "summary": "Normal operational errors, no anomaly detected",
   "root_cause": "N/A",
   "affected_services": [],
@@ -60,6 +65,7 @@ IMPORTANT: Output ONLY the raw JSON object. Do NOT wrap it in markdown code fenc
 type AnalysisResult struct {
 	IsAnomaly        bool     `json:"is_anomaly"`
 	Severity         int      `json:"severity"`
+	IssueType        string   `json:"issue_type"` // short stable category, e.g. "http_404", "db_connection_failure"
 	Summary          string   `json:"summary"`
 	RootCause        string   `json:"root_cause"`
 	AffectedServices []string `json:"affected_services"`
@@ -76,6 +82,10 @@ type BedrockAnalyzer struct {
 	rateLimiter      <-chan time.Time // rate limit LLM calls
 	notifier         Notifier         // optional notification sink
 	onAlert          func()           // optional callback fired when an anomaly alert is raised
+
+	cooldown     time.Duration        // per-service alert cooldown
+	mu           sync.Mutex           // guards lastAlerted
+	lastAlerted  map[string]time.Time // service → last alert time
 }
 
 // Notifier is an interface for sending alerts.
@@ -91,6 +101,7 @@ type BedrockConfig struct {
 	AnomalyThreshold int
 	Namespace        string
 	MinCallInterval  time.Duration // minimum time between LLM calls
+	AlertCooldown    time.Duration // per-service cooldown between alerts
 	Notifier         Notifier      // optional
 	OnAlert          func()        // optional — called when an anomaly alert fires
 }
@@ -111,6 +122,12 @@ func NewBedrockAnalyzer(ctx context.Context, cfg BedrockConfig) (*BedrockAnalyze
 		interval = 10 * time.Second
 	}
 
+	// Default alert cooldown: 15 minutes per service
+	cooldown := cfg.AlertCooldown
+	if cooldown == 0 {
+		cooldown = 15 * time.Minute
+	}
+
 	return &BedrockAnalyzer{
 		client:           client,
 		modelID:          cfg.ModelID,
@@ -120,7 +137,52 @@ func NewBedrockAnalyzer(ctx context.Context, cfg BedrockConfig) (*BedrockAnalyze
 		rateLimiter:      time.Tick(interval),
 		notifier:         cfg.Notifier,
 		onAlert:          cfg.OnAlert,
+		cooldown:         cooldown,
+		lastAlerted:      make(map[string]time.Time),
 	}, nil
+}
+
+// inCooldown returns true if THIS specific issue (service + issue_type) is
+// still within its cooldown window. A different issue_type on the same service
+// is NOT suppressed — so a new, different problem always alerts.
+// If alertable, it records the current time and returns false.
+func (b *BedrockAnalyzer) inCooldown(issueType string, services []string) bool {
+	if issueType == "" {
+		issueType = "unknown"
+	}
+	if len(services) == 0 {
+		services = []string{"_unknown"}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+
+	// Build the set of keys for this anomaly: one per (service, issueType) pair.
+	keys := make([]string, 0, len(services))
+	for _, svc := range services {
+		keys = append(keys, svc+"|"+issueType)
+	}
+
+	// Suppress only if EVERY key is still within cooldown.
+	allSuppressed := true
+	for _, k := range keys {
+		last, seen := b.lastAlerted[k]
+		if !seen || now.Sub(last) >= b.cooldown {
+			allSuppressed = false
+		}
+	}
+
+	if allSuppressed {
+		return true
+	}
+
+	// At least one (service, issue) is alertable — record all keys and allow.
+	for _, k := range keys {
+		b.lastAlerted[k] = now
+	}
+	return false
 }
 
 // Analyze sends a batch of log lines to Claude and returns the analysis.
@@ -216,19 +278,24 @@ func (b *BedrockAnalyzer) AnalyzeBatch(logs []string) {
 	}
 
 	if b.ShouldAlert(result) {
-		log.Printf("[analysis] 🚨 ANOMALY DETECTED [severity=%d]: %s", result.Severity, result.Summary)
+		log.Printf("[analysis] 🚨 ANOMALY DETECTED [severity=%d, type=%s]: %s", result.Severity, result.IssueType, result.Summary)
 		log.Printf("[analysis]    Root cause: %s", result.RootCause)
 		log.Printf("[analysis]    Affected: %v", result.AffectedServices)
 		log.Printf("[analysis]    Action: %s", result.Recommendation)
+
+		// Per-(service, issue_type) cooldown — suppress repeats of the SAME issue,
+		// but let a DIFFERENT issue on the same service alert immediately.
+		if b.inCooldown(result.IssueType, result.AffectedServices) {
+			log.Printf("[analysis]    (suppressed — %v/%s in cooldown window)", result.AffectedServices, result.IssueType)
+			return
+		}
 
 		// Send notification if configured
 		if b.notifier != nil {
 			alert := notify.Alert{
 				Severity:         result.Severity,
 				Summary:          result.Summary,
-				RootCause:        result.RootCause,
 				AffectedServices: result.AffectedServices,
-				Recommendation:   result.Recommendation,
 				Timestamp:        time.Now(),
 			}
 			if err := b.notifier.Send(ctx, alert); err != nil {

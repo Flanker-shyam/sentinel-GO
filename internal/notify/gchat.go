@@ -83,19 +83,13 @@ func (g *GoogleChatNotifier) formatMessage(alert Alert) string {
 
 *Summary:* %s
 
-*Root Cause:* %s
-
 *Affected Services:* %v
-
-*Recommendation:* %s
 
 _Detected at %s_`,
 		severityEmoji,
 		alert.Severity,
 		alert.Summary,
-		alert.RootCause,
 		alert.AffectedServices,
-		alert.Recommendation,
 		alert.Timestamp.Format("2006-01-02 15:04:05 MST"),
 	)
 }

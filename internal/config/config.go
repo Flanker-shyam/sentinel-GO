@@ -39,6 +39,7 @@ type AnalysisConfig struct {
 	MaxTokens        int           `yaml:"max_tokens"`
 	AnomalyThreshold int           `yaml:"anomaly_threshold"`
 	MinCallInterval  time.Duration `yaml:"min_call_interval"`
+	AlertCooldown    time.Duration `yaml:"alert_cooldown"`
 }
 
 // DedupConfig controls log deduplication.
@@ -110,6 +111,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Analysis.MinCallInterval == 0 {
 		c.Analysis.MinCallInterval = 10 * time.Second
+	}
+	if c.Analysis.AlertCooldown == 0 {
+		c.Analysis.AlertCooldown = 15 * time.Minute
 	}
 	if c.Dedup.Window == 0 {
 		c.Dedup.Window = 60 * time.Second

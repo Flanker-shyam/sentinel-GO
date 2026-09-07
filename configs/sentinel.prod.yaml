@@ -1,0 +1,30 @@
+# Sentinel-GO Configuration — PROD environment
+targets:
+  - namespace: "media-manager-prod"
+    pod_patterns:
+      - "media-manager-.*"
+    container_patterns:
+      - "media-manager-api"
+
+streaming:
+  buffer_size: 1000
+  tail_lines: 50
+
+dedup:
+  enabled: true
+  window: "60s"
+
+analysis:
+  batch_size: 50
+  flush_interval: "30s"
+  region: "eu-west-1"
+  model_id: "anthropic.claude-3-haiku-20240307-v1:0"  # ON_DEMAND, region-pinned to eu-west-1 (avoids eu-north-1 deny)
+  max_tokens: 2048
+  anomaly_threshold: 6
+  min_call_interval: "10s"
+  alert_cooldown: "15m"    # suppress repeat alerts for the same service within this window
+
+notification:
+  google_chat:
+    enabled: true
+    webhook_url: "${GCHAT_WEBHOOK_URL}"

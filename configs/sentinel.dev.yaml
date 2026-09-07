@@ -1,4 +1,4 @@
-# Sentinel-GO Configuration
+# Sentinel-GO Configuration — DEV environment
 targets:
   - namespace: "tp-rc"
     pod_patterns:
@@ -13,7 +13,7 @@ streaming:
 
 dedup:
   enabled: true
-  window: "60s"           # suppress duplicate lines within this window
+  window: "60s"
 
 analysis:
   batch_size: 50
@@ -22,7 +22,8 @@ analysis:
   model_id: "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
   max_tokens: 2048
   anomaly_threshold: 6
-  min_call_interval: "10s"  # rate limit: max 1 LLM call per this interval
+  min_call_interval: "10s"
+  alert_cooldown: "15m"    # suppress repeat alerts for the same service within this window
 
 notification:
   google_chat:

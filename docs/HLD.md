@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Sentinel-GO is a Go-based log streaming and anomaly detection system that continuously ingests logs from multiple AWS EKS/ECS pods, applies filtering/deduplication/cleaning pipelines, and leverages an LLM to analyze error/warning patterns — firing alerts when anomalies are detected.
+Sentinel-GO is a Go-based log streaming and anomaly detection system that continuously ingests logs from AWS EKS pods, filters by severity, deduplicates, batches, and leverages an LLM (AWS Bedrock — Claude) to analyze error/warning patterns — firing alerts to Google Chat when anomalies are detected. It applies a per-issue cooldown to avoid alert spam while still surfacing distinct incidents.
 
 ---
 
@@ -10,60 +10,42 @@ Sentinel-GO is a Go-based log streaming and anomaly detection system that contin
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AWS Cloud                                       │
-│                                                                             │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                                  │
-│  │  Pod A   │  │  Pod B   │  │  Pod N   │                                  │
-│  │ (stdout) │  │ (stdout) │  │ (stdout) │                                  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                                  │
-│       │              │              │                                        │
-│       └──────────────┼──────────────┘                                       │
-│                      │                                                      │
-│              CloudWatch Logs / K8s API                                       │
+│                              AWS EKS Cluster                                 │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐                                  │
+│   │  Pod A   │  │  Pod B   │  │  Pod N   │   (stdout, JSON logs)             │
+│   └────┬─────┘  └────┬─────┘  └────┬─────┘                                  │
+│        └─────────────┼─────────────┘                                        │
+│                      │  K8s API (Watch + follow log streams)                │
 └──────────────────────┼──────────────────────────────────────────────────────┘
                        │
                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                         Sentinel-GO Service                                  │
 │                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                     Log Ingestion Layer                                │  │
-│  │                                                                        │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                    │  │
-│  │  │ Pod Watcher │  │ Pod Watcher │  │ Pod Watcher │  (1 goroutine/pod) │  │
-│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                    │  │
-│  │         └─────────────────┼───────────────┘                           │  │
-│  │                           ▼                                            │  │
-│  │                   Raw Log Channel                                      │  │
-│  └───────────────────────────┼────────────────────────────────────────────┘  │
-│                              ▼                                                │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                   Processing Pipeline                                  │  │
-│  │                                                                        │  │
-│  │  ┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌───────────────┐   │  │
-│  │  │  Filter  │──▶│ Deduplicator │──▶│ Cleaner  │──▶│ Severity      │   │  │
-│  │  │  (noise) │   │ (bloom/hash) │   │ (parser) │   │ Classifier    │   │  │
-│  │  └──────────┘   └──────────────┘   └──────────┘   └───────┬───────┘   │  │
-│  │                                                            │           │  │
-│  └────────────────────────────────────────────────────────────┼───────────┘  │
-│                                                               ▼              │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                    LLM Analysis Engine                                 │  │
-│  │                                                                        │  │
-│  │  ┌─────────────┐   ┌──────────────┐   ┌────────────────────────────┐  │  │
-│  │  │   Batcher   │──▶│ LLM Client   │──▶│ Anomaly Scoring & Decision │  │  │
-│  │  │ (time/size) │   │ (Bedrock/    │   │                            │  │  │
-│  │  │             │   │  OpenAI)     │   └─────────────┬──────────────┘  │  │
-│  │  └─────────────┘   └──────────────┘                 │                 │  │
-│  └─────────────────────────────────────────────────────┼─────────────────┘  │
-│                                                        ▼                     │
-│  ┌────────────────────────────────────────────────────────────────────────┐  │
-│  │                     Alerting Layer                                     │  │
-│  │                                                                        │  │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────────────┐   │  │
-│  │  │   Slack   │  │  PagerDuty│  │    SNS    │  │  Webhook (generic)│   │  │
-│  │  └───────────┘  └───────────┘  └───────────┘  └───────────────────┘   │  │
-│  └────────────────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Discovery Controller (Watch API)                                     │  │
+│  │  - list-then-watch per namespace                                      │  │
+│  │  - regex match on pod + container names                               │  │
+│  │  - starts/stops one streamer goroutine per matched container          │  │
+│  └───────────────────────────────┬───────────────────────────────────────┘  │
+│                                   ▼                                          │
+│  ┌───────────────┐   streamChan   ┌───────────┐   analyzeChan   ┌─────────┐  │
+│  │  Streamers    │───────────────▶│  Dedup    │────────────────▶│ Batcher │  │
+│  │ (per pod,     │  (severity-    │ (sliding  │  (unique lines) │(time/   │  │
+│  │  retry+filter)│   filtered)    │  window)  │                 │ size)   │  │
+│  └───────────────┘                └───────────┘                 └────┬────┘  │
+│                                                                       ▼       │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Analysis Engine (Bedrock / Claude)                                   │  │
+│  │  - rate limiter → InvokeModel → structured JSON verdict               │  │
+│  │  - verdict: is_anomaly, severity, issue_type, summary, affected       │  │
+│  │  - per-(service, issue_type) cooldown gate                            │  │
+│  └───────────────────────────────┬───────────────────────────────────────┘  │
+│                                   ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Notifier (Google Chat webhook)                                       │  │
+│  │  - startup message, 30-min heartbeat (reset on alert), anomaly alerts │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,159 +53,107 @@ Sentinel-GO is a Go-based log streaming and anomaly detection system that contin
 
 ## 3. Core Components
 
-### 3.1 Log Ingestion Layer
+### 3.1 Discovery Controller (`internal/discovery`)
 
 | Aspect | Detail |
 |--------|--------|
-| **Source** | Kubernetes API (`/api/v1/namespaces/{ns}/pods/{pod}/log?follow=true`) — long-lived chunked HTTP stream, same mechanism as `kubectl logs -f` |
-| **Concurrency Model** | One goroutine per matched pod, managed by a Pod Discovery controller |
-| **Pod Discovery** | Namespace + pod name regex pattern matching. K8s Watch API detects new/terminated pods in configured namespaces; regex filter determines which pods to stream from |
-| **Backpressure** | Bounded channel (`chan LogEntry`, configurable buffer size) between ingestion and processing |
-| **Reconnection** | Exponential backoff with jitter (capped at 30s) on stream disconnects |
-| **Streaming** | Uses `client-go` `GetLogs().Stream(ctx)` — `bufio.Scanner.Scan()` blocks until next line arrives (zero CPU waste, no polling) |
+| **Mechanism** | K8s Watch API with a **list-then-watch** loop per namespace |
+| **Matching** | Regex on pod names (`pod_patterns`) and container names (`container_patterns`); empty container patterns → auto-pick first non-sidecar container |
+| **Lifecycle** | Maintains an `active` map keyed `namespace/pod/container`; starts a streamer goroutine per new match, cancels it on pod deletion/termination |
+| **Reconciliation** | On each LIST, reconciles desired vs active (starts missing, stops stale) — catches anything missed while a watch was down |
+| **Resilience** | Watch expiry (~5 min) and connectivity failures (e.g., VPN down) are handled with exponential backoff, not a busy-loop |
 
-#### Pod Discovery via Regex
+Handles scale up/down and rolling deploys automatically: new pods → new streamers, terminated pods → cancelled streamers, no log gap during rollouts.
 
-Configuration drives the scope — you specify namespace and a pod name regex pattern. The discovery controller watches those namespaces and streams logs from any pod whose name matches the pattern:
+### 3.2 Streamer (`internal/streamer`)
 
-```yaml
-ingestion:
-  targets:
-    - namespace: "production"
-      pod_pattern: "payment-.*"        # matches payment-service-7b4f9-xk2z, payment-worker-abc123
-    - namespace: "production"
-      pod_pattern: "order-.*"
-      exclude_pattern: ".*-canary-.*"  # optional: skip canary pods
-    - namespace: "staging"
-      pod_pattern: ".*"                # everything in staging
-```
+| Aspect | Detail |
+|--------|--------|
+| **Source** | K8s API `GetLogs(...).Stream(ctx)` with `Follow: true` (like `kubectl logs -f`) |
+| **Blocking read** | `bufio.Scanner.Scan()` blocks until the next line arrives — no polling, zero CPU waste |
+| **Severity filter** | Inline — parses the `"level"` field from JSON logs; forwards only `ERROR`/`WARN`/`FATAL`/`PANIC` |
+| **Reconnection** | Exponential backoff with jitter (1s → 2s → … → 30s cap) on stream failure; only exits on context cancellation |
+| **Output** | Writes filtered lines to a shared `chan string` (`streamChan`) |
 
-This approach:
-- Is intuitive (teams already think in terms of pod prefixes like `payment-*`, `order-*`)
-- Requires zero config changes on rolling deploys or scaling events
-- Provides namespace scoping to avoid accidental noise
-- Supports full regex for OR patterns, wildcards, exclusions
+### 3.3 Deduplication (`internal/dedup`)
 
-```go
-type LogEntry struct {
-    Timestamp   time.Time
-    PodName     string
-    Namespace   string
-    Container   string
-    Message     string
-```
+- Sliding-window hash set (SHA-256 of the full line)
+- Suppresses **identical** duplicate lines within a configurable window (default 60s)
+- Background cleanup goroutine evicts expired entries
+- Sits as a pipeline stage between `streamChan` and `analyzeChan`
+- Note: line-level dedup handles exact repeats; incident-level spam is handled by the alert cooldown (see 3.5)
 
-### 3.2 Processing Pipeline
+### 3.4 Batcher (`internal/analysis/batch.go`)
 
-A chain-of-responsibility pattern where each stage is a `Processor` interface:
+- Flushes a batch when **either**: batch size reached (default 50) **or** time window elapsed (default 30s)
+- Empty windows are skipped (no wasted LLM calls)
 
-```go
-type Processor interface {
-    Process(ctx context.Context, entry LogEntry) (*LogEntry, error)
-}
-```
+### 3.5 Analysis Engine (`internal/analysis/bedrock.go`)
 
-#### 3.2.1 Filter
-- Drops known noise (health checks, readiness probes, debug-level spam)
-- Configurable via regex/glob allowlist and denylist in YAML config
+**LLM client**
+- AWS Bedrock via `bedrock-runtime:InvokeModel`
+- Credentials from the default AWS chain (saml2aws / IRSA) — no keys in code
+- Rate limiter (`time.Tick`) enforces a minimum interval between calls (default 10s) to control cost/throttling
+- Response text is defensively unwrapped (strips markdown fences / trailing prose) before JSON parsing
 
-#### 3.2.2 Deduplicator
-- Uses a time-windowed bloom filter (or sliding-window hash set) to suppress duplicate log lines
-- Window size configurable (default: 60s)
-- Key = hash(pod_name + normalized_message)
-
-#### 3.2.3 Cleaner / Parser
-- Strips ANSI escape codes, trims whitespace
-- Attempts structured parsing (JSON logs → extract fields)
-- Normalizes timestamps to UTC
-
-#### 3.2.4 Severity Classifier
-- Regex-based first pass: matches `ERROR`, `WARN`, `FATAL`, `PANIC`, stack traces
-- Outputs only `ERROR` and `WARNING` severity entries to the next stage
-- Attaches severity label to the LogEntry
-
-### 3.3 LLM Analysis Engine
-
-#### 3.3.1 Batcher
-- Collects filtered log entries into batches by:
-  - **Time window**: flush every N seconds (default: 30s)
-  - **Size threshold**: flush when batch reaches M entries (default: 50)
-- Groups logs by namespace/service for contextual analysis
-
-#### 3.3.2 LLM Client
-- Abstracts the LLM provider behind an interface:
-
-```go
-type Analyzer interface {
-    Analyze(ctx context.Context, batch []LogEntry) (*AnalysisResult, error)
-}
-```
-
-- Supported backends:
-  - **AWS Bedrock** (Claude, Titan) — preferred for staying within AWS
-  - **OpenAI API** (GPT-4) — fallback/alternative
-- Prompt engineering:
-  - System prompt defines the role: "You are a production incident analyst..."
-  - Provides log batch as context
-  - Asks for: anomaly detection, root cause hypothesis, severity score (1-10), recommended action
-
-#### 3.3.3 Anomaly Scoring & Decision
-- LLM returns structured JSON response:
+**Structured verdict**
 
 ```go
 type AnalysisResult struct {
-    IsAnomaly       bool     `json:"is_anomaly"`
-    Severity        int      `json:"severity"` // 1-10
-    Summary         string   `json:"summary"`
-    RootCause       string   `json:"root_cause"`
-    AffectedPods    []string `json:"affected_pods"`
-    Recommendation  string   `json:"recommendation"`
+    IsAnomaly        bool     `json:"is_anomaly"`
+    Severity         int      `json:"severity"`   // 1-10
+    IssueType        string   `json:"issue_type"` // stable snake_case category
+    Summary          string   `json:"summary"`
+    RootCause        string   `json:"root_cause"`
+    AffectedServices []string `json:"affected_services"`
+    Recommendation   string   `json:"recommendation"`
 }
 ```
 
-- Alert fires when `IsAnomaly == true && Severity >= threshold` (configurable, default: 6)
-- Cooldown period per service to avoid alert fatigue (default: 5 min)
+**Decision + cooldown**
+- Alert fires when `IsAnomaly && Severity >= anomaly_threshold` (default 6) **and** the issue is not in cooldown
+- Cooldown is keyed on **`(service, issue_type)`**, not service alone:
+  - Same issue repeating on a service → alert once, suppress for the cooldown window (default 15m)
+  - A **different** `issue_type` on the same service → alerts immediately (not suppressed)
+  - After the window expires, the ongoing issue alerts again as a reminder
+- `issue_type` is an LLM-assigned stable category (e.g., `http_404_errors`, `db_connection_failure`, `out_of_memory`) so recurring problems map to the same key
 
-### 3.4 Alerting Layer
+### 3.6 Notifier (`internal/notify`)
 
-- Pluggable alert sinks via interface:
-
-```go
-type AlertSink interface {
-    Send(ctx context.Context, alert Alert) error
-}
-```
-
-- Built-in sinks: Slack webhook, AWS SNS, PagerDuty, generic HTTP webhook
-- Alert payload includes: summary, affected pods, severity, timestamp, raw log sample, LLM analysis
+- Google Chat via incoming webhook (`SendText` / `Send`)
+- Three message types:
+  - **Startup**: `✅ Sentinel-GO is up and watching for errors.`
+  - **Heartbeat**: `💚 all good` every 30 min of quiet; the timer resets whenever an anomaly alert fires
+  - **Anomaly alert**: severity, summary, affected services (root cause/recommendation currently logged only, not sent)
 
 ---
 
 ## 4. Data Flow
 
 ```
-Pod Logs (stream)
-    │
-    ▼
-[Ingestion] ──buffered channel──▶ [Filter] ──▶ [Dedup] ──▶ [Clean] ──▶ [Classify]
-                                                                            │
-                                                              (errors/warnings only)
-                                                                            │
-                                                                            ▼
-                                                                       [Batcher]
-                                                                            │
-                                                              (time or size trigger)
-                                                                            │
-                                                                            ▼
-                                                                     [LLM Analysis]
-                                                                            │
-                                                                  (anomaly detected?)
-                                                                            │
-                                                                   YES      │     NO
-                                                                    ▼       │      ▼
-                                                              [Fire Alert]  │  [Discard]
-                                                                            │
-                                                                         [Metrics]
+Pods ──(Watch)──▶ Discovery Controller ──spawns──▶ Streamers (per pod/container)
+                                                        │ severity filter
+                                                        ▼
+                                                   streamChan
+                                                        │
+                                                    [Dedup]  (sliding window)
+                                                        │
+                                                   analyzeChan
+                                                        │
+                                                    [Batcher] (time or size)
+                                                        │
+                                                  [Rate limiter]
+                                                        │
+                                                  [Bedrock/Claude]
+                                                        │
+                                              is_anomaly && severity>=T ?
+                                                        │ yes
+                                                  [Cooldown gate]  (service+issue_type)
+                                                        │ not suppressed
+                                                        ▼
+                                                 [Google Chat alert]
+                                                        │
+                                                 (resets heartbeat timer)
 ```
 
 ---
@@ -232,93 +162,68 @@ Pod Logs (stream)
 
 ```
 sentinel-GO/
-├── cmd/
-│   └── sentinel/
-│       └── main.go              # Entrypoint, config loading, DI wiring
+├── cmd/sentinel/main.go               # Entrypoint — config selection + DI wiring
 ├── internal/
-│   ├── config/
-│   │   └── config.go           # YAML config struct and loader
-│   ├── ingestion/
-│   │   ├── watcher.go          # Pod log watcher (K8s API / CloudWatch)
-│   │   ├── discovery.go        # Pod discovery controller
-│   │   └── checkpoint.go       # Stream position checkpointing
-│   ├── pipeline/
-│   │   ├── pipeline.go         # Pipeline orchestrator
-│   │   ├── filter.go           # Noise filter
-│   │   ├── dedup.go            # Deduplicator (bloom filter)
-│   │   ├── cleaner.go          # Log cleaner/parser
-│   │   └── classifier.go       # Severity classifier
+│   ├── k8s/client.go                  # K8s clientset (kubeconfig / in-cluster)
+│   ├── discovery/
+│   │   ├── types.go                   # Target, PodStream, StreamFunc, helpers
+│   │   ├── discovery.go               # One-shot Discover()
+│   │   └── controller.go              # Dynamic list-then-watch controller
+│   ├── streamer/streamer.go           # Follow-stream + severity filter + retry
+│   ├── dedup/dedup.go                 # Sliding-window dedup
 │   ├── analysis/
-│   │   ├── batcher.go          # Log batching logic
-│   │   ├── analyzer.go         # Analyzer interface
-│   │   ├── bedrock.go          # AWS Bedrock implementation
-│   │   └── openai.go           # OpenAI implementation
-│   ├── alerting/
-│   │   ├── manager.go          # Alert routing, cooldowns, dedup
-│   │   ├── slack.go            # Slack sink
-│   │   ├── sns.go              # SNS sink
-│   │   └── webhook.go          # Generic webhook sink
-│   └── models/
-│       └── types.go            # Shared types (LogEntry, Alert, etc.)
+│   │   ├── batch.go                   # Time/size batching
+│   │   └── bedrock.go                 # Bedrock client, prompt, cooldown, rate limit
+│   ├── notify/gchat.go                # Google Chat webhook notifier
+│   └── config/
+│       ├── config.go                  # YAML loader + env expansion + defaults
+│       └── dotenv.go                  # .env loader
 ├── configs/
-│   └── sentinel.yaml           # Default configuration
-├── docs/
-│   └── HLD.md                  # This document
+│   ├── sentinel.dev.yaml
+│   └── sentinel.prod.yaml
+├── docs/HLD.md
+├── .env.example
 ├── go.mod
-├── go.sum
-└── Makefile
+└── go.sum
 ```
 
 ---
 
 ## 6. Configuration
 
-```yaml
-# configs/sentinel.yaml
-ingestion:
-  buffer_size: 10000
-  reconnect_backoff_max: 30s
-  targets:
-    - namespace: "production"
-      pod_pattern: "payment-.*"
-    - namespace: "production"
-      pod_pattern: "order-.*"
-      exclude_pattern: ".*-canary-.*"
-    - namespace: "staging"
-      pod_pattern: ".*"
+Config file is selected by `SENTINEL_ENV` (`dev` default, `prod`, or any `<env>` → `configs/sentinel.<env>.yaml`); the `-config` flag overrides. `${VAR}` references are expanded from the environment, with a `.env` file auto-loaded at startup (real env vars take precedence).
 
-pipeline:
-  filter:
-    deny_patterns:
-      - "health.*check"
-      - "GET /ready"
-      - "kube-probe"
-  dedup:
-    window: 60s
-    max_entries: 100000
-  classifier:
-    min_severity: "WARN"       # Only pass WARN+ to analysis
+```yaml
+targets:
+  - namespace: "tp-rc"
+    pod_patterns:
+      - "plan-outcome-reporting-.*"
+    container_patterns:
+      - "plan-outcome-reporting-compute"
+      - "plan-outcome-reporting-api"
+
+streaming:
+  buffer_size: 1000
+  tail_lines: 50
+
+dedup:
+  enabled: true
+  window: "60s"
 
 analysis:
-  provider: "bedrock"          # "bedrock" | "openai"
-  model: "anthropic.claude-3-sonnet"
-  batch_window: 30s
   batch_size: 50
-  anomaly_threshold: 6         # severity 1-10
-  cooldown_per_service: 5m
+  flush_interval: "30s"
+  region: "eu-west-1"
+  model_id: "anthropic.claude-3-haiku-20240307-v1:0"
   max_tokens: 2048
+  anomaly_threshold: 6
+  min_call_interval: "10s"
+  alert_cooldown: "15m"
 
-alerting:
-  sinks:
-    - type: "slack"
-      webhook_url: "${SLACK_WEBHOOK_URL}"
-      channel: "#incidents"
-    - type: "sns"
-      topic_arn: "arn:aws:sns:us-east-1:123456789:sentinel-alerts"
-
-observability:
-  metrics_port: 9090
-  log_level: "info"
+notification:
+  google_chat:
+    enabled: true
+    webhook_url: "${GCHAT_WEBHOOK_URL}"
 ```
 
 ---
@@ -327,44 +232,60 @@ observability:
 
 | Decision | Rationale |
 |----------|-----------|
-| **Go language** | Low memory footprint, excellent concurrency primitives (goroutines/channels), fast startup for containerized deployment |
-| **Goroutine-per-pod** | Simple model; Go scheduler handles thousands of goroutines efficiently |
-| **Bloom filter for dedup** | O(1) lookup, memory-efficient for high-throughput log streams; acceptable false-positive rate (~1%) |
-| **Batch before LLM** | Reduces API calls/cost; provides context window for pattern detection across related logs |
-| **Structured LLM output** | JSON schema enforcement allows programmatic decision-making on anomaly scores |
-| **Cooldown per service** | Prevents alert storms during cascading failures |
-| **Interface-driven design** | Swappable LLM providers, alert sinks, and ingestion sources without code changes |
+| **Go language** | Low memory footprint, first-class concurrency (goroutines/channels), fast container startup |
+| **Goroutine-per-container** | Simple model; Go scheduler handles many streams efficiently |
+| **Watch API + list-then-watch** | Real-time pod lifecycle tracking; reconciliation closes gaps from expired/broken watches |
+| **Inline severity filter** | Cheap first pass; only errors/warnings reach the LLM, cutting cost |
+| **Sliding-window dedup** | Removes exact-duplicate lines cheaply before batching |
+| **Batch before LLM** | Fewer API calls, and richer context for cross-line pattern detection |
+| **Rate limiter on LLM** | Bounds cost and avoids Bedrock throttling during error storms |
+| **Structured JSON verdict** | Enables programmatic thresholding and cooldown keys |
+| **Cooldown on (service, issue_type)** | Prevents spam from one ongoing incident while still alerting on *different* problems — fails toward over-alerting, never silently dropping a new issue |
+| **Region-pinned model option** | Avoids cross-region inference profiles that can hit region-scoped IAM deny policies |
+| **Env-based config** | One image, many environments/accounts; deploy once per account |
 
 ---
 
-## 8. Non-Functional Requirements
+## 8. Resilience
 
-| Requirement | Target |
-|-------------|--------|
-| **Throughput** | 10,000+ log lines/sec across all pods |
-| **Latency (ingestion → alert)** | < 60s for critical anomalies |
-| **Memory** | < 512 MB for 100 pods |
-| **Availability** | Stateless design; horizontal scaling via pod replicas |
-| **LLM Cost Control** | Batching + severity pre-filter reduces API calls by ~90% |
-| **Fault Tolerance** | Graceful degradation if LLM is unavailable (queue and retry) |
+| Failure | Handling |
+|---------|----------|
+| Log stream breaks (pod restart, network blip) | Streamer exponential-backoff reconnect |
+| K8s watch expires (~5 min) | Re-list + reconcile + re-watch |
+| API connectivity lost (e.g., VPN down locally) | Watch loop backs off instead of busy-looping; auto-recovers when connectivity returns |
+| Pod scaled/redeployed | Discovery starts/stops streamers automatically |
+| LLM returns fenced/annotated JSON | Response unwrapped before parsing |
+| LLM unavailable / error | Logged; batch dropped for that cycle (no crash) |
+| Bedrock throttling | Rate limiter caps call frequency |
 
 ---
 
 ## 9. Deployment Model
 
-- **Containerized**: Single Docker image, deploy as a Deployment in the same EKS cluster
-- **IAM**: Requires `logs:FilterLogEvents`, `logs:DescribeLogGroups`, `bedrock:InvokeModel`, `sns:Publish`
-- **Service Account**: IRSA (IAM Roles for Service Accounts) for pod-level AWS permissions
-- **Scaling**: Horizontal — shard by namespace/label selector across replicas
-- **Health**: `/healthz` and `/readyz` endpoints; Prometheus metrics at `/metrics`
+- **Containerized**: single image; deploy as a Deployment in each target EKS cluster
+- **Auth**: in-cluster service account via IRSA (no kubeconfig needed in-cluster); Bedrock uses the pod role
+- **Cross-account**: run **one deployment per account**, each with its own `SENTINEL_ENV` config (namespace, region, model), all pointing at the same Google Chat webhook — keeps accounts isolated and avoids cross-account IAM complexity
+- **IAM**: `bedrock:InvokeModel` on the Claude model/profile in use
 
 ---
 
-## 10. Future Enhancements
+## 10. Non-Functional Targets
 
-- **Correlation engine**: Group related errors across services into a single incident
-- **Feedback loop**: Allow operators to mark false positives → fine-tune severity thresholds
-- **Historical context**: Feed past incident patterns to LLM for better detection
-- **Multi-cluster support**: Aggregate logs across multiple EKS clusters
-- **Cost dashboard**: Track LLM API usage and per-service analysis costs
-- **Local LLM option**: Support Ollama/vLLM for air-gapped environments
+| Requirement | Target |
+|-------------|--------|
+| Latency (ingestion → alert) | < ~60s for critical anomalies |
+| Memory | Low — bounded channels + streaming reads |
+| Availability | Stateless; restart-safe |
+| LLM cost control | Severity filter + dedup + batching + rate limit |
+| Fault tolerance | Graceful degradation; auto-reconnect at every layer |
+
+---
+
+## 11. Future Enhancements
+
+- Plain-text (non-JSON) log severity detection
+- Prometheus metrics endpoint (`/metrics`) + health probes
+- Additional notification sinks (Slack, PagerDuty, SNS)
+- Richer alerts (include root cause + recommendation, currently logged only)
+- Historical incident context fed to the LLM
+- Correlation engine to group related errors across services into one incident
