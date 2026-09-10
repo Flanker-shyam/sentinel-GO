@@ -1,0 +1,30 @@
+# Prebuilt local binaries — must be rebuilt inside the image
+sentinel
+sentinel-GO
+*.exe
+
+# Secrets / local env — never bake into the image
+.env
+.env.*
+!.env.example
+
+# VCS / IDE / OS noise
+.git
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+
+# Docs & CI that don't belong in the build context
+README.md
+DEPLOY.md
+docs/
+deploy/
+.gitlab-ci.yml
+Dockerfile
+.dockerignore
+
+# Go build/test caches
+.go-cache/
+*.test
+*.out
