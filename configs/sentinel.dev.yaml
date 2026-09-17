@@ -1,11 +1,11 @@
 # Sentinel-GO Configuration — DEV environment
 targets:
-  - namespace: "tp-rc"
+  - namespace: "" # k8 namespace
     pod_patterns:
-      - "plan-outcome-reporting-.*"
+      - "financial-service-*" #pod pattern (can be identifiable prefix)
     container_patterns:
-      - "plan-outcome-reporting-compute"
-      - "plan-outcome-reporting-api"
+      - ""  #container names
+      - ""
 
 streaming:
   buffer_size: 1000
@@ -18,8 +18,8 @@ dedup:
 analysis:
   batch_size: 50
   flush_interval: "30s"
-  region: "eu-west-1"
-  model_id: "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+  region: ""  # cluster region
+  model_id: "" #take model id from Bedrock and paste here
   max_tokens: 2048
   anomaly_threshold: 6
   min_call_interval: "10s"

@@ -195,12 +195,12 @@ Config file is selected by `SENTINEL_ENV` (`dev` default, `prod`, or any `<env>`
 
 ```yaml
 targets:
-  - namespace: "tp-rc"
+  - namespace: ""
     pod_patterns:
-      - "plan-outcome-reporting-.*"
+      - ".*"
     container_patterns:
-      - "plan-outcome-reporting-compute"
-      - "plan-outcome-reporting-api"
+      - ""
+      - ""
 
 streaming:
   buffer_size: 1000
@@ -213,8 +213,8 @@ dedup:
 analysis:
   batch_size: 50
   flush_interval: "30s"
-  region: "eu-west-1"
-  model_id: "anthropic.claude-3-haiku-20240307-v1:0"
+  region: ""
+  model_id: ""
   max_tokens: 2048
   anomaly_threshold: 6
   min_call_interval: "10s"

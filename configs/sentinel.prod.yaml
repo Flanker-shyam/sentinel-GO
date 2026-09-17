@@ -1,10 +1,10 @@
 # Sentinel-GO Configuration — PROD environment
 targets:
-  - namespace: "media-manager-prod"
+  - namespace: ""
     pod_patterns:
-      - "media-manager-.*"
+      - "booking-service-api-.*"
     container_patterns:
-      - "media-manager-api"
+      - ""
 
 streaming:
   buffer_size: 1000
@@ -17,8 +17,8 @@ dedup:
 analysis:
   batch_size: 50
   flush_interval: "30s"
-  region: "eu-west-1"
-  model_id: "anthropic.claude-3-haiku-20240307-v1:0"  # ON_DEMAND, region-pinned to eu-west-1 (avoids eu-north-1 deny)
+  region: ""
+  model_id: ""  # ON_DEMAND, region-pinned to eu-west-1 (avoids eu-north-1 deny)
   max_tokens: 2048
   anomaly_threshold: 6
   min_call_interval: "10s"

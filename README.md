@@ -44,7 +44,7 @@ kubectl get pods -n tp-rc
 # Verify Bedrock access (region-pinned model)
 echo '{"anthropic_version":"bedrock-2023-05-31","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}' > /tmp/test.json
 aws bedrock-runtime invoke-model \
-  --model-id anthropic.claude-3-haiku-20240307-v1:0 \
+  --model-id MODEL_ID_HERE \
   --region eu-west-1 \
   --content-type application/json \
   --body fileb:///tmp/test.json \
@@ -52,7 +52,7 @@ aws bedrock-runtime invoke-model \
 cat /tmp/output.json
 ```
 
-> **Note on model IDs:** Cross-region inference profiles (e.g., `eu.anthropic.claude-...`) route requests across multiple EU regions. If an account has a region-scoped deny policy (e.g., denying `eu-north-1`), use a region-pinned `ON_DEMAND` model like `anthropic.claude-3-haiku-20240307-v1:0` instead.
+> **Note on model IDs:** Cross-region inference profiles (e.g., `eu.anthropic.claude-...`) route requests across multiple EU regions. If an account has a region-scoped deny policy (e.g., denying `eu-north-1`), use a region-pinned `ON_DEMAND` model like `anthropic.claude-3-haiku` instead.
 
 ### 4. Configure
 
@@ -69,12 +69,12 @@ Each environment can target a different account, namespace, and Bedrock model. E
 
 ```yaml
 targets:
-  - namespace: "tp-rc"
+  - namespace: ""
     pod_patterns:
-      - "plan-outcome-reporting-.*"
+      - "-.*"
     container_patterns:
-      - "plan-outcome-reporting-compute"
-      - "plan-outcome-reporting-api"
+      - ""
+      - ""
 
 streaming:
   buffer_size: 1000
@@ -87,8 +87,8 @@ dedup:
 analysis:
   batch_size: 50
   flush_interval: "30s"
-  region: "eu-west-1"
-  model_id: "anthropic.claude-3-haiku-20240307-v1:0"
+  region: ""
+  model_id: ""
   max_tokens: 2048
   anomaly_threshold: 6
   min_call_interval: "10s"
